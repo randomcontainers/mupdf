@@ -1,0 +1,114 @@
+name: mupdf
+title: MuPDF
+summary: Renders, converts, merges, encrypts and repairs PDF files with mutool, and converts EPUB, XPS, CBZ, HTML and Markdown documents.
+homepage: https://mupdf.com/
+license: AGPL-3.0-or-later AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND FTL AND IJG AND ISC AND MIT AND MIT-Modern-Variant AND OFL-1.1 AND Unicode-TOU AND X11 AND Zlib
+source-release: true
+upstream:
+  source: github-release
+  repository: ArtifexSoftware/mupdf-downloads
+  # Release tags look like 1.28.5; release candidates (1.28.0-rc1) do not match.
+  tag-pattern: '^(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.28.5
+  artifact:
+    url: https://github.com/ArtifexSoftware/mupdf-downloads/releases/download/{version}/mupdf-{version}-source.tar.gz
+    sha256: 98a5c10cda20c3992cdf76ff6b2a1149c32bd79cc796d3f703230b1185b7e934
+image:
+  entrypoint: [mutool]
+  cmd: [-v]
+test:
+  - |
+    mutool -v 2> version.txt
+    test "$(cat version.txt)" = "mutool version $VERSION"
+  - |
+    printf '%s\n' '%%MediaBox 0 0 300 100' '%%Font Helv Helvetica' \
+      'BT /Helv 24 Tf 20 40 Td (Hello from MuPDF) Tj ET' > hello.txt
+    mutool create -o hello.pdf hello.txt
+    test "$(head -c 5 hello.pdf)" = %PDF-
+    mutool info hello.pdf > info.txt
+    grep -Fq 'Pages: 1' info.txt
+    grep -Fq 'Type1 "Helvetica"' info.txt
+    mutool draw -q -F txt -o hello-text.txt hello.pdf
+    grep -Fqx 'Hello from MuPDF' hello-text.txt
+    mutool draw -q -r 72 -o hello.png hello.pdf
+    test "$(head -c 4 hello.png | tail -c 3)" = PNG
+  - |
+    # A black square on the left half of a 20x10 point page, rendered and
+    # read back through the JavaScript API.
+    printf '%s\n' '%%MediaBox 0 0 20 10' '0 g 0 0 10 10 re f' > box.txt
+    mutool create -o box.pdf box.txt
+    cat > box.js <<'EOF'
+    var page = Document.openDocument("box.pdf").loadPage(0);
+    var pix = page.toPixmap(Matrix.identity, ColorSpace.DeviceGray, false);
+    print(pix.getWidth(), pix.getHeight(), pix.getSample(2, 5, 0), pix.getSample(17, 5, 0));
+    EOF
+    test "$(mutool run box.js)" = '20 10 0 255'
+  - |
+    printf '%s\n' '%%MediaBox 0 0 300 100' '%%Font Helv Helvetica' \
+      'BT /Helv 24 Tf 20 40 Td (Hello from MuPDF) Tj ET' > hello.txt
+    printf '%s\n' '%%MediaBox 0 0 20 10' '0 g 0 0 10 10 re f' > box.txt
+    mutool create -o hello.pdf hello.txt
+    mutool create -o box.pdf box.txt
+    mutool merge -o merged.pdf hello.pdf box.pdf
+    mutool pages merged.pdf > pages.txt
+    test "$(grep -c '<page ' pages.txt)" -eq 2
+    mutool clean -gggz -E aes-256 -U secret -O owner merged.pdf locked.pdf
+    if mutool draw -q -F txt -o - locked.pdf > /dev/null 2>&1; then
+      echo "opened an encrypted PDF without its password" >&2
+      exit 1
+    fi
+    mutool draw -q -p secret -F txt -o unlocked.txt locked.pdf 1
+    grep -Fqx 'Hello from MuPDF' unlocked.txt
+  - |
+    printf '%s\n' '# Release notes' '' 'Some *Markdown* text.' > notes.md
+    mutool convert -o notes.pdf notes.md
+    mutool draw -q -F txt -o notes.txt notes.pdf
+    grep -Fqx 'Release notes' notes.txt
+    grep -Fqx 'Some Markdown text.' notes.txt
+    # PDF to Word goes through the extract library; MuPDF then reads the
+    # document back.
+    printf '%s\n' '%%MediaBox 0 0 300 100' '%%Font Helv Helvetica' \
+      'BT /Helv 24 Tf 20 40 Td (Hello from MuPDF) Tj ET' > hello.txt
+    mutool create -o hello.pdf hello.txt
+    mutool convert -o hello.docx hello.pdf
+    test "$(head -c 2 hello.docx)" = PK
+    mutool draw -q -F txt -o docx.txt hello.docx
+    grep -Fqx 'Hello from MuPDF' docx.txt
+  - |
+    # Text beyond Latin is shaped with HarfBuzz and drawn with the Noto and
+    # Source Han fonts built into mutool.
+    text='Καλημέρα Привет 你好 مرحبا नमस्ते'
+    printf '<!DOCTYPE html><html><body><p>%s</p></body></html>\n' "$text" > scripts.html
+    mutool draw -q -F txt -o scripts.txt scripts.html
+    grep -Fqx "$text" scripts.txt
+    mutool draw -q -F stext -o scripts.xml scripts.html
+    for font in 'Noto Naskh Arabic' 'Noto Serif Devanagari' 'Source Han Serif'; do
+      grep -Fq "font name=\"$font" scripts.xml || { echo "no text drawn with $font" >&2; exit 1; }
+    done
+  - |
+    # Signing reads the certificate with OpenSSL; a build without it fails
+    # with "No OpenSSL support" instead.
+    printf '%s\n' '%%MediaBox 0 0 300 100' > blank.txt
+    mutool create -o blank.pdf blank.txt
+    cat > field.js <<'EOF'
+    var doc = Document.openDocument("blank.pdf");
+    doc.loadPage(0).createSignature("Approval");
+    doc.save("unsigned.pdf");
+    EOF
+    mutool run field.js
+    mutool sign unsigned.pdf > fields.txt
+    grep -Fq 'Signature is not signed.' fields.txt
+    echo 'not a certificate' > junk.pfx
+    mutool sign -s junk.pfx -P x -o signed.pdf unsigned.pdf > sign.out 2> sign.err || true
+    grep -Fq 'Invalid pfx file' sign.err
+examples:
+  - title: Render every page of a PDF to a 150 dpi PNG
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/mupdf draw -r 150 -o page-%d.png input.pdf
+  - title: Extract the text of a PDF
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/mupdf draw -F txt -o output.txt input.pdf
+  - title: Merge several PDFs into one
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/mupdf merge -o merged.pdf first.pdf second.pdf
+  - title: Convert an EPUB book to PDF
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/mupdf convert -o book.pdf book.epub

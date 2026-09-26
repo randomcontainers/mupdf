@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN find /lib /usr/lib -maxdepth 1 -name '*.so*' | sed 's,.*/,,' | LC_ALL=C sort -u > /tmp/base-sonames; \
+    apk add --no-cache \
+      build-base \
+      curl \
+      openssl-dev \
+      pkgconf
+
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/ArtifexSoftware/mupdf-downloads/releases/download/${VERSION}/mupdf-${VERSION}-source.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/mupdf.tar.gz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/mupdf.tar.gz" | sha256sum -c -; \
+    mkdir /src; \
+    tar -xzf /tmp/mupdf.tar.gz -C /src --strip-components=1; \
+    rm /tmp/mupdf.tar.gz; \
+    echo "$url" > /tmp/source-url
+
+# mutool is linked statically against the libraries bundled in the tarball,
+# as upstream builds it: MuPDF uses its own fork of Little CMS (lcms2mt) and
+# versions of the other libraries that match its release. OpenSSL, for PDF
+# signatures, is the only shared library it needs besides the C library. The
+# hyphenation patterns, which come under many licenses of their own, are
+# left out.
+ARG JOBS
+WORKDIR /src
+RUN for d in brotli cmark-gfm extract freetype gumbo-parser harfbuzz jbig2dec lcms2 libjpeg mujs openjpeg zlib; do \
+      test -n "$(find "thirdparty/$d" -type f -print -quit)" || { echo "thirdparty/$d is empty" >&2; exit 1; }; \
+    done; \
+    set -- build=release HAVE_X11=no HAVE_GLUT=no XCFLAGS=-DFZ_ENABLE_HYPHEN=0; \
+    echo "$*" > /tmp/make-flags; \
+    make -j"${JOBS:-$(nproc)}" "$@" prefix=/usr/local DESTDIR=/out install-apps
+
+COPY runtime-deps.alpine /tmp/runtime-deps.extra
+# Code compiled into mutool under other licenses has its notice in a source
+# comment, usually the first one with a copyright line.
+RUN mutool=/out/usr/local/bin/mutool; \
+    test "$("$mutool" -v 2>&1)" = "mutool version ${VERSION}"; \
+    readelf -d "$mutool" > /tmp/mutool.dynamic; \
+    grep -q 'NEEDED.*\[libcrypto\.so' /tmp/mutool.dynamic; \
+    meta=/out/usr/local/share/randomcontainers/mupdf; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING thirdparty/freetype/docs/FTL.TXT "$meta/licenses/"; \
+    cp thirdparty/brotli/LICENSE "$meta/licenses/LICENSE.brotli"; \
+    cp thirdparty/cmark-gfm/COPYING "$meta/licenses/COPYING.cmark-gfm"; \
+    cp thirdparty/gumbo-parser/COPYING "$meta/licenses/COPYING.gumbo"; \
+    cp thirdparty/harfbuzz/COPYING "$meta/licenses/COPYING.harfbuzz"; \
+    cp thirdparty/harfbuzz/src/ms-use/COPYING "$meta/licenses/COPYING.harfbuzz-ms-use"; \
+    cp thirdparty/jbig2dec/LICENSE "$meta/licenses/LICENSE.jbig2dec"; \
+    cp thirdparty/lcms2/LICENSE "$meta/licenses/LICENSE.lcms2mt"; \
+    cp thirdparty/libjpeg/README "$meta/licenses/README.libjpeg"; \
+    cp thirdparty/mujs/COPYING "$meta/licenses/COPYING.mujs"; \
+    cp thirdparty/openjpeg/LICENSE "$meta/licenses/LICENSE.openjpeg"; \
+    cp thirdparty/zlib/LICENSE "$meta/licenses/LICENSE.zlib"; \
+    cp resources/fonts/droid/NOTICE "$meta/licenses/DroidSansFallback.NOTICE"; \
+    cp resources/fonts/han/LICENSE.txt "$meta/licenses/OFL.source-han-serif"; \
+    cp resources/fonts/noto/COPYING "$meta/licenses/OFL.noto"; \
+    cp resources/fonts/sil/OFL.txt "$meta/licenses/OFL.charis-sil"; \
+    cp resources/fonts/urw/OFL.txt "$meta/licenses/OFL.urw-base35"; \
+    sed -n 's/^%%Copyright: \{0,1\}//p' resources/cmaps/Adobe-Japan1-UCS2 > "$meta/licenses/COPYING.cmaps"; \
+    grep -F -B1 -A1 'Rich Felker' source/fitz/string.c | sed 's,^[[:space:]]*// *,,' > "$meta/licenses/COPYING.strverscmp"; \
+    grep -F -A12 'Copyright (c) 2008-2009 Bjoern Hoehrmann' thirdparty/gumbo-parser/src/utf8.c | sed 's,^// *,,' \
+      > "$meta/licenses/COPYING.gumbo-utf8"; \
+    grep -F -A5 'Copyright 2001, softSurfer' thirdparty/lcms2/src/cmssm.c | sed 's/^[[:space:]]*//' \
+      > "$meta/licenses/COPYING.lcms2mt-cmssm"; \
+    for f in source/fitz/bidi-imp.h source/fitz/crypt-aes.c source/fitz/crypt-arc4.c source/fitz/crypt-md5.c \
+      source/fitz/ftoa.c source/fitz/icc34.h source/fitz/ucdn.c thirdparty/freetype/src/base/fthash.c; do \
+      n="${f##*/}"; \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+        "$f" > "$meta/licenses/COPYING.${n%.*}"; \
+    done; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) printf "%s\n", b }' \
+      source/pdf/annotation-icons.h > "$meta/licenses/COPYING.annotation-icons"; \
+    for f in "$meta"/licenses/*; do test -s "$f"; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    { \
+      echo "source-sha256=${SOURCE_SHA256}"; \
+      echo "make=$(cat /tmp/make-flags)"; \
+      echo "compiler=$(cc --version | sed -n 1p)"; \
+    } > "$meta/buildinfo"; \
+    export LC_ALL=C; \
+    find /out/usr/local -type f | while read -r f; do \
+      if readelf -h "$f" > /dev/null 2>&1; then \
+        readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p'; \
+      fi; \
+    done | sort -u | while read -r so; do \
+      if [ -n "$(find /out/usr/local -name "$so")" ]; then continue; fi; \
+      if grep -qxF "$so" /tmp/base-sonames; then continue; fi; \
+      echo "so:$so"; \
+    done > /tmp/runtime-deps.elf; \
+    cat /tmp/runtime-deps.elf /tmp/runtime-deps.extra | sort -u > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/mupdf/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "mutool"]
+CMD ["-v"]

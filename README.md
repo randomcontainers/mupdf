@@ -11,8 +11,6 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontain
   draw -r 150 -o page-%d.png input.pdf
 ```
 
-The same images can also be pulled as `randomcontainers.com/mupdf`.
-
 Extract the text of a PDF:
 
 ```sh

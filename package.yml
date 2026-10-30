@@ -11,10 +11,10 @@ upstream:
   tag-pattern: '^(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.28.5
+  version: 1.28.6
   artifact:
     url: https://github.com/ArtifexSoftware/mupdf-downloads/releases/download/{version}/mupdf-{version}-source.tar.gz
-    sha256: 98a5c10cda20c3992cdf76ff6b2a1149c32bd79cc796d3f703230b1185b7e934
+    sha256: dc85000640a45d90ca9b77b061f6ca67cce0c4d4fbecf8819647baf573eef101
 image:
   entrypoint: [mutool]
   cmd: [-v]
